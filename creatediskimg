@@ -1,0 +1,260 @@
+#!/usr/bin/env python
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+try:
+    from configparser import ConfigParser
+except:
+    from ConfigParser import ConfigParser
+from getpass import getuser
+from math import ceil
+from os import makedirs, stat, system
+from os.path import abspath, exists, expanduser
+from subprocess import PIPE, Popen
+from time import sleep
+
+
+class DiskImageCreator(object):
+    def __init__(self):
+        super(DiskImageCreator, self).__init__()
+        self.tmp_img = self.expandpath('tmp.img')
+        self.tmp_img_dir = '%s.d' % self.tmp_img
+        self.fat_size = 32
+        self.offset = 512
+        self.one_meg = 1024 * 1024
+        self.block_size = self.one_meg
+        self.min_size_f32 = 33 * self.one_meg
+        self.min_size_f16 = 9 * self.one_meg
+        self.img_dir = None
+        self.general = None
+        self.utils = None
+
+    def run(self):
+        self.parse_args()
+        user = getuser()
+        if user != 'root':
+            print('must be run as root')
+            return
+        try:
+            self.check_args()
+        except Exception as e:
+            print('Error:', e)
+            return
+        try:
+            self.find_utils()
+        except Exception as e:
+            print('Error:', e)
+            return
+        try:
+            self.determine_img_size()
+        except Exception as e:
+            print('Error:', e)
+            self.cleanup_tmp_img()
+            return
+        try:
+            self.do_img_creation()
+        except Exception as e:
+            print('Error:', e)
+        self.cleanup()
+        if self.usb_dev:
+            self.write_img_to_usb_stick()
+        else:
+            print('')
+            print('Note:')
+            print('usb_dev was not specified, so the disk image was not')
+            print('written to a USB stick. Give usb_dev a valid device name in')
+            print('the %r file and run again if you want the' % self.config)
+            print('image to be written to a USB stick. Or you can maually')
+            print('run the command below using a valid device name for your')
+            print('USB stick.')
+            print('sudo dd if=%s of=/dev/sdX bs=1M' % self.img_name)
+
+    def parse_args(self):
+        parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+        parser.add_argument('--config', default='options.ini',
+                help='Configuration file')
+        self.config = self.expandpath(parser.parse_args().config)
+
+    def check_args(self):
+        if not exists(self.config):
+            raise Exception('%r config file does not exist' % self.config)
+        args = ConfigParser()
+        args.read([self.config])
+        self.general = dict(args.items('general'))
+        self.utils = dict(args.items('utils'))
+        self.img_name = self.expandpath(self.general['img_name'])
+        if not self.img_name:
+            self.img_name = self.expandpath('disk.img')
+        if exists(self.img_name):
+            raise Exception('%r already exists' % self.img_name)
+        self.bios_exe = self.expandpath(self.general['bios_exe'])
+        if not self.bios_exe:
+            raise Exception('bios_exe must be specified in %r' % self.config)
+        if not exists(self.bios_exe):
+            raise Exception('%r does not exist' % self.bios_exe)
+        self.usb_dev = self.general['usb_dev']
+        self.img_files = self.expandpath(self.general['img_files'])
+        if not self.img_files:
+            self.img_files = self.expandpath('img-files')
+        if not exists(self.img_files):
+            raise Exception('%r does not exist' % self.img_files)
+        self.img_dir = '%s.d' % self.img_name
+        print('img_name: ', '%r' % self.img_name)
+        print('bios_exe: ', '%r' % self.bios_exe)
+        print('usb_dev:  ', '%r' % self.usb_dev)
+        print('img_files:', '%r' % self.img_files)
+        print('img_dir:  ', '%r' % self.img_dir)
+
+    def expandpath(self, path):
+        return abspath(expanduser(path))
+
+    def find_utils(self):
+        not_found = []
+        for name, location in self.utils.items():
+            if not exists(location):
+                not_found.append(location)
+            else:
+                print('found:', location)
+        if not_found:
+            for location in not_found:
+                print('%r does not exist' % location)
+            raise Exception('missing required utils')
+
+    def opencmd(self, *args):
+        cmd = list(args)
+        proc = Popen(cmd, shell=False, stdout=PIPE)
+        out = proc.stdout.read().decode()
+        if out[-1] == '\n':
+            out = out[:-1]
+        return out
+
+    def determine_img_size(self):
+        print('Determining required size of %r' % self.img_name)
+        if exists(self.tmp_img_dir):
+            raise Exception('%s already exists' % self.tmp_img_dir)
+        blocks = 128
+        size = blocks * self.block_size - 511
+        self.runcmd('%s if=/dev/zero of=%s bs=%dc count=%d', self.utils['dd'],
+                self.tmp_img, self.block_size, blocks)
+        self.runcmd('%s --script %s mklabel msdos', self.utils['parted'],
+                self.tmp_img)
+        self.runcmd('%s --script %s unit B mkpart primary fat32 512 %d',
+                self.utils['parted'], self.tmp_img, size)
+        self.runcmd('%s --script %s set 1 boot on', self.utils['parted'],
+                self.tmp_img)
+        dev_name = self.get_dos_dev_name(self.tmp_img)
+        self.runcmd('%s -F 32 %s', self.utils['mkfs'], dev_name)
+        self.runcmd('%s -i %s', self.utils['syslinux'], dev_name)
+        makedirs(self.tmp_img_dir)
+        self.runcmd('%s %s %s', self.utils['mount'], dev_name,
+                self.tmp_img_dir)
+        self.runcmd('%s -Tr %s %s', self.utils['cp'], self.img_files,
+                self.tmp_img_dir)
+        self.runcmd('%s %s %s/bios.exe', self.utils['cp'], self.bios_exe,
+                self.tmp_img_dir)
+        cmd = [self.utils['du'], '-bs', self.tmp_img_dir] 
+        print(' '.join(cmd))
+        proc = Popen(cmd, shell=False, stdout=PIPE)
+        out = proc.stdout.read().decode()
+        megs = ceil(int(out.split('\t')[0]) / self.one_meg)
+        self.required_img_size = megs * self.one_meg
+        print('required img size:', self.required_img_size)
+        self.runcmd('%s %s', self.utils['umount'], self.tmp_img_dir)
+        self.runcmd('%s -d %s', self.utils['kpartx'], self.tmp_img)
+        self.runcmd('%s -rf %s', self.utils['rm'], self.tmp_img_dir)
+        self.runcmd('%s -f %s', self.utils['rm'], self.tmp_img)
+
+    def cleanup_tmp_img(self):
+        self.runcmd('%s %s', self.utils['umount'], self.tmp_img_dir)
+        self.runcmd('%s -d %s', self.utils['kpartx'], self.tmp_img)
+        self.runcmd('%s -rf %s', self.utils['rm'], self.tmp_img_dir)
+        self.runcmd('%s -f %s', self.utils['rm'], self.tmp_img)
+
+    def do_img_creation(self):
+        self.do_file_check()
+        self.create_disk_img()
+        self.create_dos_partition()
+        self.format_disk_img()
+        self.install_syslinux()
+        self.copy_custom_files()
+
+    def do_file_check(self):
+        if not exists(self.img_files):
+            raise Exception('Missing directory containing custom files')
+
+    def create_disk_img(self):
+        if self.required_img_size < self.min_size_f32:
+            self.fat_size = 16
+        if self.required_img_size < self.min_size_f16:
+            self.required_img_size = self.min_size_f16
+        print('adjusted required size:', self.required_img_size)
+        blocks = self.required_img_size / self.block_size
+        self.parted_size = self.required_img_size - (self.offset - 1)
+        self.runcmd('%s if=/dev/zero of=%s bs=%dc count=%d', self.utils['dd'],
+                self.img_name, self.block_size, blocks)
+
+    def create_dos_partition(self):
+        self.runcmd('%s --script %s mklabel msdos', self.utils['parted'],
+                self.img_name)
+        self.runcmd('%s --script %s unit B mkpart primary fat%d %d %d',
+                self.utils['parted'], self.img_name, self.fat_size,
+                self.offset, self.parted_size)
+        self.runcmd('%s --script %s set 1 boot on', self.utils['parted'],
+                self.img_name)
+
+    def format_disk_img(self):
+        self.dev_name = self.get_dos_dev_name(self.img_name)
+        self.runcmd('%s -F %d -n LINUXBIOS %s', self.utils['mkfs'],
+                self.fat_size, self.dev_name)
+
+    def install_syslinux(self):
+        self.runcmd('%s -i %s', self.utils['syslinux'], self.dev_name)
+
+    def copy_custom_files(self):
+        self.mount_disk_img()
+        self.runcmd('%s -Tr %s %s', self.utils['cp'], self.img_files,
+                self.img_dir)
+        self.runcmd('%s %s %s/bios.exe', self.utils['cp'], self.bios_exe,
+                self.img_dir)
+        self.umount_disk_img()
+
+    def mount_disk_img(self):
+        if not exists(self.img_dir):
+            makedirs(self.img_dir)
+        self.runcmd('%s %s %s', self.utils['mount'], self.dev_name,
+                self.img_dir)
+
+    def umount_disk_img(self):
+        if self.img_dir:
+            self.runcmd('%s %s', self.utils['umount'], self.img_dir)
+            sleep(1)
+
+    def get_dos_dev_name(self, img_file):
+        cmd = ['sudo', '/sbin/kpartx', '-av', img_file]
+        print(' '.join(cmd))
+        proc = Popen(cmd, shell=False, stdout=PIPE)
+        out = proc.stdout.read().decode()
+        sleep(1)
+        dev_name = out.split(' ')[2]
+        return '/dev/mapper/%s' % dev_name
+
+    def cleanup(self):
+        self.runcmd('%s -d %s', self.utils['kpartx'], self.img_name)
+        sleep(1)
+        if self.img_dir:
+            self.runcmd('%s -rf %s', self.utils['rm'], self.img_dir)
+
+    def write_img_to_usb_stick(self):
+        if self.usb_dev:
+            self.runcmd('%s if=%s of=%s bs=%dc', self.utils['dd'],
+                    self.img_name, self.usb_dev, self.one_meg)
+
+    def runcmd(self, cmd, *args):
+        cmd = cmd % args
+        print(cmd)
+        ret = system(cmd)
+        if ret != 0:
+            raise Exception('Failed to run "%s"' % cmd)
+
+
+if __name__ == '__main__':
+    DiskImageCreator().run()
+
