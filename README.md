@@ -63,3 +63,13 @@ You can change the path for any utility to allow the script to succeed. You may
 have to change ```mkfs``` to point to the utility on your system that creates
 a FAT filesystem.
 
+# FreeDOS
+The included ```img-files``` directory was bootstrapped using files from the
+FreeDOS distribution. The FreeDOS website is:
+
+http://www.freedos.org/
+
+You can download the ISO I extracted the files from here:
+
+http://www.freedos.org/download/download/fd11src.iso
+
